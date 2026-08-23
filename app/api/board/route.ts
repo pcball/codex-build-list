@@ -1,4 +1,5 @@
 import { eq } from "drizzle-orm";
+import { env } from "cloudflare:workers";
 import { getDb } from "../../../db";
 import { boards } from "../../../db/schema";
 
@@ -19,10 +20,15 @@ function validPasswordRecord(value:unknown):value is PasswordRecord{
 
 export async function GET(request:Request){
   const email=owner(request);if(!email)return Response.json({error:"Unauthorized"},{status:401});
-  const [row]=await getDb().select().from(boards).where(eq(boards.ownerEmail,email)).limit(1);
+  const db=getDb();const [row]=await db.select().from(boards).where(eq(boards.ownerEmail,email)).limit(1);
   if(!row)return Response.json({tasks:null,revision:0,hasPassword:false});
+  const resetEnv=env as unknown as {PASSWORD_RESET_TOKEN?:string;PASSWORD_RESET_RECORD?:string};
+  let passwordJson=row.passwordJson;
+  if(resetEnv.PASSWORD_RESET_TOKEN&&resetEnv.PASSWORD_RESET_RECORD&&row.passwordResetToken!==resetEnv.PASSWORD_RESET_TOKEN){
+    try{const record=JSON.parse(resetEnv.PASSWORD_RESET_RECORD);if(validPasswordRecord(record)){passwordJson=JSON.stringify(record);await db.update(boards).set({passwordJson,passwordResetToken:resetEnv.PASSWORD_RESET_TOKEN,revision:row.revision+1,updatedAt:Date.now()}).where(eq(boards.ownerEmail,email))}}catch{}
+  }
   let tasks:Task[]=[];try{const parsed=JSON.parse(row.tasksJson);if(Array.isArray(parsed))tasks=parsed.filter(validTask)}catch{}
-  return Response.json({tasks,revision:row.revision,hasPassword:Boolean(row.passwordJson),updatedAt:row.updatedAt});
+  return Response.json({tasks,revision:row.revision,hasPassword:Boolean(passwordJson),updatedAt:row.updatedAt});
 }
 
 export async function PUT(request:Request){
