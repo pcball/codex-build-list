@@ -21,6 +21,7 @@ const blankTask = { title:"", description:"", category:"新產品", priority:"�
 const PASSWORD_KEY = "codex-build-list-password-v1";
 const UNLOCKED_KEY = "codex-build-list-unlocked-v1";
 const MIGRATION_KEY = "codex-build-list-cloud-migrated-v1";
+const DIRTY_KEY = "codex-build-list-cloud-pending-v1";
 const TASKS_KEY = "codex-build-list-v1";
 type PasswordRecord = { salt:string; hash:string; iterations:number };
 
@@ -70,21 +71,22 @@ export default function Home() {
         const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)throw new Error("sync unavailable");
         const cloud=await response.json() as {tasks:Task[]|null;hasPassword:boolean};let next:Task[];
         const needsMigration=!window.localStorage.getItem(MIGRATION_KEY);
-        if(cloud.tasks===null)next=local??seed;else next=local&&needsMigration?mergeForMigration(cloud.tasks,local):cloud.tasks;
+        const hasPendingChanges=Boolean(window.localStorage.getItem(DIRTY_KEY));
+        if(cloud.tasks===null)next=local??seed;else if(local&&hasPendingChanges)next=local;else next=local&&needsMigration?mergeForMigration(cloud.tasks,local):cloud.tasks;
         let hasPassword=cloud.hasPassword;
-        if(cloud.tasks===null||(local&&needsMigration)||(!cloud.hasPassword&&localPassword&&needsMigration)){
+        if(cloud.tasks===null||(local&&hasPendingChanges)||(local&&needsMigration)||(!cloud.hasPassword&&localPassword&&needsMigration)){
           const saved=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks:next,migrationPassword:localPassword})});if(!saved.ok)throw new Error("migration failed");const result=await saved.json() as {hasPassword:boolean};hasPassword=result.hasPassword;
         }
-        if(cancelled)return;const serialized=JSON.stringify(next);lastServerJson.current=serialized;setTasks(next);window.localStorage.setItem(TASKS_KEY,serialized);window.localStorage.setItem(MIGRATION_KEY,"yes");setHasPassword(hasPassword);setLocked(hasPassword&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setCloudReady(true);setSyncState("saved");
+        if(cancelled)return;const serialized=JSON.stringify(next);lastServerJson.current=serialized;setTasks(next);window.localStorage.setItem(TASKS_KEY,serialized);window.localStorage.setItem(MIGRATION_KEY,"yes");window.localStorage.removeItem(DIRTY_KEY);setHasPassword(hasPassword);setLocked(hasPassword&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setCloudReady(true);setSyncState("saved");
       }catch{
-        if(cancelled)return;const fallback=local??seed;setTasks(fallback);setHasPassword(Boolean(localPassword));setLocked(Boolean(localPassword)&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setSyncState("offline");
+        if(cancelled)return;const fallback=local??seed;lastServerJson.current=JSON.stringify(fallback);setTasks(fallback);setHasPassword(Boolean(localPassword));setLocked(Boolean(localPassword)&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setSyncState("offline");
       }finally{if(!cancelled){setPasswordReady(true);setLoaded(true)}}
     }
     start();return()=>{cancelled=true};
   },[]);
   useEffect(()=>{
-    if(!loaded)return;const serialized=JSON.stringify(tasks);window.localStorage.setItem(TASKS_KEY,serialized);if(!cloudReady||serialized===lastServerJson.current)return;
-    const timer=window.setTimeout(()=>{setSyncState("saving");syncQueue.current=syncQueue.current.then(async()=>{const response=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks})});if(!response.ok)throw new Error("save failed");lastServerJson.current=JSON.stringify(tasks);setSyncState("saved")}).catch(()=>setSyncState("offline"))},450);return()=>window.clearTimeout(timer);
+    if(!loaded)return;const serialized=JSON.stringify(tasks);window.localStorage.setItem(TASKS_KEY,serialized);if(!cloudReady){if(serialized!==lastServerJson.current)window.localStorage.setItem(DIRTY_KEY,"yes");return}if(serialized===lastServerJson.current)return;
+    const timer=window.setTimeout(()=>{setSyncState("saving");syncQueue.current=syncQueue.current.then(async()=>{const response=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks})});if(!response.ok)throw new Error("save failed");lastServerJson.current=JSON.stringify(tasks);window.localStorage.removeItem(DIRTY_KEY);setSyncState("saved")}).catch(()=>{window.localStorage.setItem(DIRTY_KEY,"yes");setSyncState("offline")})},450);return()=>window.clearTimeout(timer);
   },[tasks,loaded,cloudReady]);
   useEffect(()=>{
     if(!cloudReady)return;async function refresh(){if(JSON.stringify(tasks)!==lastServerJson.current)return;try{const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)return;const cloud=await response.json() as {tasks:Task[]|null;hasPassword:boolean};if(!cloud.tasks)return;const serialized=JSON.stringify(cloud.tasks);setHasPassword(cloud.hasPassword);if(serialized!==lastServerJson.current){lastServerJson.current=serialized;setTasks(cloud.tasks);window.localStorage.setItem(TASKS_KEY,serialized)}}catch{}}
