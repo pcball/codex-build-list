@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Status = "idea" | "planning" | "building" | "done";
 type Priority = "高" | "中" | "低";
@@ -20,6 +20,8 @@ const seed:Task[] = [
 const blankTask = { title:"", description:"", category:"新產品", priority:"中" as Priority, effort:"中型功能", status:"idea" as Status };
 const PASSWORD_KEY = "codex-build-list-password-v1";
 const UNLOCKED_KEY = "codex-build-list-unlocked-v1";
+const MIGRATION_KEY = "codex-build-list-cloud-migrated-v1";
+const TASKS_KEY = "codex-build-list-v1";
 type PasswordRecord = { salt:string; hash:string; iterations:number };
 
 function bytesToBase64(bytes:Uint8Array){let binary="";bytes.forEach(byte=>binary+=String.fromCharCode(byte));return window.btoa(binary)}
@@ -32,6 +34,9 @@ async function passwordHash(password:string,salt:Uint8Array,iterations=180000){
 async function createPasswordRecord(password:string):Promise<PasswordRecord>{const salt=crypto.getRandomValues(new Uint8Array(16));return {salt:bytesToBase64(salt),hash:await passwordHash(password,salt),iterations:180000}}
 async function verifyPassword(password:string,record:PasswordRecord){return (await passwordHash(password,base64ToBytes(record.salt),record.iterations))===record.hash}
 function pinOnly(value:string){return value.replace(/\D/g,"").slice(0,6)}
+function readLocalTasks(){const raw=window.localStorage.getItem(TASKS_KEY);if(!raw)return null;try{const parsed=JSON.parse(raw);return Array.isArray(parsed)?parsed as Task[]:null}catch{return null}}
+function readLocalPassword(){const raw=window.localStorage.getItem(PASSWORD_KEY);if(!raw)return null;try{return JSON.parse(raw) as PasswordRecord}catch{return null}}
+function mergeForMigration(remote:Task[],local:Task[]){const defaults=new Map(seed.map(task=>[task.id,JSON.stringify(task)]));const merged=new Map(remote.map(task=>[task.id,task]));for(const task of local){const unchangedDefault=defaults.get(task.id)===JSON.stringify(task);if(!unchangedDefault||!merged.has(task.id))merged.set(task.id,task)}return [...merged.values()]}
 
 function Icon({ name, size=18 }:{ name:"plus"|"search"|"grid"|"box"|"spark"|"trash"|"edit"|"arrow"|"arrowBack"|"close"|"settings"|"lock"|"unlock"; size?:number }) {
   const paths = {
@@ -55,33 +60,55 @@ export default function Home() {
   const [locked,setLocked] = useState(false); const [passwordReady,setPasswordReady] = useState(false);
   const [unlockInput,setUnlockInput] = useState(""); const [unlockError,setUnlockError] = useState(""); const [unlockBusy,setUnlockBusy] = useState(false);
   const [currentPassword,setCurrentPassword] = useState(""); const [newPassword,setNewPassword] = useState(""); const [confirmPassword,setConfirmPassword] = useState(""); const [settingsMessage,setSettingsMessage] = useState(""); const [settingsError,setSettingsError] = useState(""); const [settingsBusy,setSettingsBusy] = useState(false);
+  const [cloudReady,setCloudReady] = useState(false); const [syncState,setSyncState] = useState<"loading"|"saved"|"saving"|"offline">("loading");
+  const lastServerJson=useRef(""); const syncQueue=useRef<Promise<void>>(Promise.resolve());
   useEffect(()=>{
-    const saved=window.localStorage.getItem("codex-build-list-v1");if(saved){try{setTasks(JSON.parse(saved))}catch{}}
-    const passwordExists=Boolean(window.localStorage.getItem(PASSWORD_KEY));setHasPassword(passwordExists);
-    setLocked(passwordExists&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setPasswordReady(true);setLoaded(true);
+    let cancelled=false;
+    async function start(){
+      const local=readLocalTasks();const localPassword=readLocalPassword();
+      try{
+        const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)throw new Error("sync unavailable");
+        const cloud=await response.json() as {tasks:Task[]|null;hasPassword:boolean};let next:Task[];
+        const needsMigration=!window.localStorage.getItem(MIGRATION_KEY);
+        if(cloud.tasks===null)next=local??seed;else next=local&&needsMigration?mergeForMigration(cloud.tasks,local):cloud.tasks;
+        let hasPassword=cloud.hasPassword;
+        if(cloud.tasks===null||(local&&needsMigration)||(!cloud.hasPassword&&localPassword&&needsMigration)){
+          const saved=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks:next,migrationPassword:localPassword})});if(!saved.ok)throw new Error("migration failed");const result=await saved.json() as {hasPassword:boolean};hasPassword=result.hasPassword;
+        }
+        if(cancelled)return;const serialized=JSON.stringify(next);lastServerJson.current=serialized;setTasks(next);window.localStorage.setItem(TASKS_KEY,serialized);window.localStorage.setItem(MIGRATION_KEY,"yes");setHasPassword(hasPassword);setLocked(hasPassword&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setCloudReady(true);setSyncState("saved");
+      }catch{
+        if(cancelled)return;const fallback=local??seed;setTasks(fallback);setHasPassword(Boolean(localPassword));setLocked(Boolean(localPassword)&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setSyncState("offline");
+      }finally{if(!cancelled){setPasswordReady(true);setLoaded(true)}}
+    }
+    start();return()=>{cancelled=true};
   },[]);
-  useEffect(()=>{ if(loaded) window.localStorage.setItem("codex-build-list-v1",JSON.stringify(tasks)); },[tasks,loaded]);
+  useEffect(()=>{
+    if(!loaded)return;const serialized=JSON.stringify(tasks);window.localStorage.setItem(TASKS_KEY,serialized);if(!cloudReady||serialized===lastServerJson.current)return;
+    const timer=window.setTimeout(()=>{setSyncState("saving");syncQueue.current=syncQueue.current.then(async()=>{const response=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks})});if(!response.ok)throw new Error("save failed");lastServerJson.current=JSON.stringify(tasks);setSyncState("saved")}).catch(()=>setSyncState("offline"))},450);return()=>window.clearTimeout(timer);
+  },[tasks,loaded,cloudReady]);
+  useEffect(()=>{
+    if(!cloudReady)return;async function refresh(){if(JSON.stringify(tasks)!==lastServerJson.current)return;try{const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)return;const cloud=await response.json() as {tasks:Task[]|null;hasPassword:boolean};if(!cloud.tasks)return;const serialized=JSON.stringify(cloud.tasks);setHasPassword(cloud.hasPassword);if(serialized!==lastServerJson.current){lastServerJson.current=serialized;setTasks(cloud.tasks);window.localStorage.setItem(TASKS_KEY,serialized)}}catch{}}
+    const timer=window.setInterval(refresh,15000);window.addEventListener("focus",refresh);return()=>{window.clearInterval(timer);window.removeEventListener("focus",refresh)};
+  },[cloudReady,tasks]);
   const visibleTasks=useMemo(()=>tasks.filter(task=>`${task.title} ${task.description} ${task.category}`.toLowerCase().includes(query.toLowerCase())&&(priority==="全部"||task.priority===priority)),[tasks,query,priority]);
   function openNew(status:Status="idea"){setEditingId(null);setForm({...blankTask,status});setModalOpen(true)}
   function openEdit(task:Task){setEditingId(task.id);setForm({title:task.title,description:task.description,category:task.category,priority:task.priority,effort:task.effort,status:task.status});setModalOpen(true)}
   function saveTask(e:FormEvent){e.preventDefault();if(!form.title.trim())return;if(editingId)setTasks(c=>c.map(t=>t.id===editingId?{...t,...form,title:form.title.trim()}:t));else setTasks(c=>[...c,{...form,title:form.title.trim(),id:crypto.randomUUID(),createdAt:Date.now()}]);setModalOpen(false)}
   function moveTask(task:Task){const i=columns.findIndex(c=>c.id===task.status);if(i<columns.length-1)setTasks(c=>c.map(t=>t.id===task.id?{...t,status:columns[i+1].id}:t))}
   function moveTaskBack(task:Task){const i=columns.findIndex(c=>c.id===task.status);if(i>0)setTasks(c=>c.map(t=>t.id===task.id?{...t,status:columns[i-1].id}:t))}
-  function readPasswordRecord(){const raw=window.localStorage.getItem(PASSWORD_KEY);if(!raw)return null;try{return JSON.parse(raw) as PasswordRecord}catch{return null}}
-  async function unlock(e:FormEvent){e.preventDefault();setUnlockError("");setUnlockBusy(true);const record=readPasswordRecord();if(record&&await verifyPassword(unlockInput,record)){window.sessionStorage.setItem(UNLOCKED_KEY,"yes");setLocked(false);setUnlockInput("")}else setUnlockError("密碼不正確，請再試一次。");setUnlockBusy(false)}
+  async function unlock(e:FormEvent){e.preventDefault();setUnlockError("");setUnlockBusy(true);let ok=false;try{const response=await fetch("/api/unlock",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin:unlockInput})});ok=response.ok&&Boolean((await response.json()).ok)}catch{const record=readLocalPassword();ok=Boolean(record&&await verifyPassword(unlockInput,record))}if(ok){window.sessionStorage.setItem(UNLOCKED_KEY,"yes");setLocked(false);setUnlockInput("")}else setUnlockError("密碼不正確，請再試一次。");setUnlockBusy(false)}
   function openSettings(){setCurrentPassword("");setNewPassword("");setConfirmPassword("");setSettingsMessage("");setSettingsError("");setSettingsOpen(true)}
   async function savePassword(e:FormEvent){
     e.preventDefault();setSettingsError("");setSettingsMessage("");
     if(!/^\d{6}$/.test(newPassword)){setSettingsError("密碼必須剛好是 6 位數字。");return}if(newPassword!==confirmPassword){setSettingsError("兩次輸入的新密碼不一致。");return}
-    setSettingsBusy(true);const record=readPasswordRecord();if(record&&!(await verifyPassword(currentPassword,record))){setSettingsError("目前密碼不正確。");setSettingsBusy(false);return}
-    const next=await createPasswordRecord(newPassword);window.localStorage.setItem(PASSWORD_KEY,JSON.stringify(next));window.sessionStorage.setItem(UNLOCKED_KEY,"yes");setHasPassword(true);setCurrentPassword("");setNewPassword("");setConfirmPassword("");setSettingsMessage(record?"密碼已更新。":"進入密碼已啟用。");setSettingsBusy(false);
+    setSettingsBusy(true);const next=await createPasswordRecord(newPassword);try{const response=await fetch("/api/password",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({currentPassword,newRecord:next})});const result=await response.json() as {error?:string};if(!response.ok){setSettingsError(result.error||"密碼更新失敗。");setSettingsBusy(false);return}window.localStorage.setItem(PASSWORD_KEY,JSON.stringify(next));window.sessionStorage.setItem(UNLOCKED_KEY,"yes");setHasPassword(true);setCurrentPassword("");setNewPassword("");setConfirmPassword("");setSettingsMessage(hasPassword?"密碼已更新，所有裝置立即生效。":"進入密碼已啟用，所有裝置立即生效。")}catch{setSettingsError("暫時無法連接雲端，請稍後再試。")}setSettingsBusy(false);
   }
-  async function removePassword(){setSettingsError("");setSettingsMessage("");const record=readPasswordRecord();if(!record)return;if(!(await verifyPassword(currentPassword,record))){setSettingsError("請輸入正確的目前密碼，才能移除密碼。");return}window.localStorage.removeItem(PASSWORD_KEY);window.sessionStorage.removeItem(UNLOCKED_KEY);setHasPassword(false);setCurrentPassword("");setSettingsMessage("進入密碼已移除。");}
+  async function removePassword(){setSettingsError("");setSettingsMessage("");try{const response=await fetch("/api/password",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({currentPassword,newRecord:null})});const result=await response.json() as {error?:string};if(!response.ok){setSettingsError(result.error||"密碼移除失敗。");return}window.localStorage.removeItem(PASSWORD_KEY);window.sessionStorage.removeItem(UNLOCKED_KEY);setHasPassword(false);setCurrentPassword("");setSettingsMessage("進入密碼已移除，所有裝置立即生效。")}catch{setSettingsError("暫時無法連接雲端，請稍後再試。")}}
   function lockNow(){window.sessionStorage.removeItem(UNLOCKED_KEY);setSettingsOpen(false);setLocked(true)}
   const done=tasks.filter(t=>t.status==="done").length, active=tasks.filter(t=>t.status==="building").length;
 
   if(!passwordReady)return <main className="loading-screen" aria-label="載入中"><span className="brand-mark"><Icon name="spark" size={23}/></span></main>;
-  if(locked)return <main className="lock-screen"><section className="lock-card"><span className="lock-logo"><Icon name="lock" size={25}/></span><p className="eyebrow">PRIVATE WORKSPACE</p><h1>歡迎回來</h1><p>輸入你的 6 位數字密碼，進入 Codex 功能與產品待辦板。</p><form onSubmit={unlock}><label htmlFor="unlock-password">6 位數字密碼</label><input id="unlock-password" autoFocus type="password" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="current-password" value={unlockInput} onChange={e=>setUnlockInput(pinOnly(e.target.value))} placeholder="••••••" aria-describedby="unlock-hint"/><span className="password-hint" id="unlock-hint">請輸入 6 位數字，手機會自動顯示數字鍵盤。</span><div className="field-note" aria-live="polite">{unlockError}</div><button className="primary-button" type="submit" disabled={unlockBusy||unlockInput.length!==6}>{unlockBusy?"驗證中…":"解鎖待辦板"}<Icon name="unlock" size={17}/></button></form><small>密碼只保存在這部裝置上。</small></section></main>;
+  if(locked)return <main className="lock-screen"><section className="lock-card"><span className="lock-logo"><Icon name="lock" size={25}/></span><p className="eyebrow">PRIVATE WORKSPACE</p><h1>歡迎回來</h1><p>輸入你的 6 位數字密碼，進入 Codex 功能與產品待辦板。</p><form onSubmit={unlock}><label htmlFor="unlock-password">6 位數字密碼</label><input id="unlock-password" autoFocus type="password" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="current-password" value={unlockInput} onChange={e=>setUnlockInput(pinOnly(e.target.value))} placeholder="••••••" aria-describedby="unlock-hint"/><span className="password-hint" id="unlock-hint">請輸入 6 位數字，手機會自動顯示數字鍵盤。</span><div className="field-note" aria-live="polite">{unlockError}</div><button className="primary-button" type="submit" disabled={unlockBusy||unlockInput.length!==6}>{unlockBusy?"驗證中…":"解鎖待辦板"}<Icon name="unlock" size={17}/></button></form><small>密碼與待辦內容已透過雲端同步。</small></section></main>;
 
   return <main className="app-shell">
     <aside className="sidebar">
@@ -91,7 +118,7 @@ export default function Home() {
       <div className="profile"><span>LW</span><div><strong>李偉康</strong><small>個人工作空間</small></div><button className="mobile-settings" aria-label="開啟設定" onClick={openSettings}><Icon name="settings"/></button></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><div><p className="eyebrow">CODEX BUILD QUEUE</p><h1>想打造什麼？</h1><p className="intro">把產品和功能構想集中在這裡，一步一步交給 Codex 完成。</p></div><button className="primary-button" onClick={()=>openNew()}><Icon name="plus"/>新增構想</button></header>
+      <header className="topbar"><div><p className="eyebrow">CODEX BUILD QUEUE</p><h1>想打造什麼？</h1><p className="intro">把產品和功能構想集中在這裡，一步一步交給 Codex 完成。</p></div><div className="topbar-actions"><span className={`sync-status ${syncState}`}><i/>{syncState==="loading"?"連接雲端…":syncState==="saving"?"同步中…":syncState==="offline"?"離線保存":"已同步"}</span><button className="primary-button" onClick={()=>openNew()}><Icon name="plus"/>新增構想</button></div></header>
       <section className="summary" aria-label="待辦摘要">
         <div><span className="summary-icon peach"><Icon name="box"/></span><p>全部構想<strong>{tasks.length}</strong></p></div><div><span className="summary-icon purple"><Icon name="spark"/></span><p>開發中<strong>{active}</strong></p></div><div><span className="summary-icon green">✓</span><p>已完成<strong>{done}</strong></p></div>
         <div className="progress-wrap"><p><span>整體進度</span><strong>{tasks.length?Math.round(done/tasks.length*100):0}%</strong></p><div className="progress"><i style={{width:`${tasks.length?done/tasks.length*100:0}%`}}/></div></div>
@@ -107,7 +134,7 @@ export default function Home() {
       <div className="form-grid"><label>所屬項目<input value={form.category} onChange={e=>setForm({...form,category:e.target.value})}/></label><label>目前階段<select value={form.status} onChange={e=>setForm({...form,status:e.target.value as Status})}>{columns.map(c=><option value={c.id} key={c.id}>{c.name}</option>)}</select></label><label>優先級<select value={form.priority} onChange={e=>setForm({...form,priority:e.target.value as Priority})}><option>高</option><option>中</option><option>低</option></select></label><label>預計投入<select value={form.effort} onChange={e=>setForm({...form,effort:e.target.value})}><option>快速修改</option><option>中型功能</option><option>大型功能</option><option>需要研究</option></select></label></div>
       <div className="form-actions">{editingId&&<button type="button" className="delete-button" onClick={()=>{setTasks(c=>c.filter(t=>t.id!==editingId));setModalOpen(false)}}><Icon name="trash" size={16}/>刪除</button>}<button type="button" className="cancel-button" onClick={()=>setModalOpen(false)}>取消</button><button type="submit" className="primary-button">{editingId?"儲存修改":"加入待辦板"}</button></div></form></section></div>}
     {settingsOpen&&<div className="modal-backdrop" onMouseDown={()=>setSettingsOpen(false)}><section className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" aria-label="關閉" onClick={()=>setSettingsOpen(false)}><Icon name="close"/></button><p className="eyebrow">SETTINGS</p><h2 id="settings-title">安全設定</h2><p className="modal-lead">設定固定 6 位數字的進入密碼。關閉瀏覽器工作階段後，系統會再次要求密碼。</p>
-      <div className={`security-status ${hasPassword?"enabled":""}`}><span><Icon name={hasPassword?"lock":"unlock"}/></span><div><strong>{hasPassword?"密碼保護已啟用":"尚未設定進入密碼"}</strong><p>{hasPassword?"你的待辦板已加上裝置密碼鎖。":"設定後，其他使用這部裝置的人無法直接打開內容。"}</p></div></div>
+      <div className={`security-status ${hasPassword?"enabled":""}`}><span><Icon name={hasPassword?"lock":"unlock"}/></span><div><strong>{hasPassword?"密碼保護已啟用":"尚未設定進入密碼"}</strong><p>{hasPassword?"同一組密碼適用於你的所有裝置。":"設定後，密碼會同步到手機和電腦。"}</p></div></div>
       <form onSubmit={savePassword}>{hasPassword&&<label>目前密碼<input type="password" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="current-password" value={currentPassword} onChange={e=>setCurrentPassword(pinOnly(e.target.value))} placeholder="輸入目前的 6 位數字"/></label>}<label>{hasPassword?"新密碼":"設定密碼"}<input type="password" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="new-password" value={newPassword} onChange={e=>setNewPassword(pinOnly(e.target.value))} placeholder="輸入 6 位數字"/><span className="password-hint">只能使用 0–9，必須剛好 6 位；可以包含開頭的 0。</span></label><label>確認新密碼<input type="password" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="new-password" value={confirmPassword} onChange={e=>setConfirmPassword(pinOnly(e.target.value))} placeholder="再次輸入相同的 6 位數字"/></label><div className={`settings-feedback ${settingsError?"error":""}`} aria-live="polite">{settingsError||settingsMessage}</div>
       <div className="form-actions settings-actions">{hasPassword&&<button type="button" className="delete-button" onClick={removePassword}>移除密碼</button>}{hasPassword&&<button type="button" className="cancel-button" onClick={lockNow}><Icon name="lock" size={15}/>立即鎖定</button>}<button type="submit" className="primary-button" disabled={settingsBusy}>{settingsBusy?"儲存中…":hasPassword?"更新密碼":"啟用密碼"}</button></div></form></section></div>}
   </main>;
