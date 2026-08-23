@@ -13,8 +13,8 @@ export async function POST(request:Request){
   const email=owner(request);if(!email)return Response.json({error:"Unauthorized"},{status:401});
   const body=await request.json().catch(()=>null) as {currentPassword?:unknown;newRecord?:unknown}|null;if(!body)return Response.json({error:"Invalid request"},{status:400});
   const db=getDb();const [row]=await db.select().from(boards).where(eq(boards.ownerEmail,email)).limit(1);if(!row)return Response.json({error:"Board unavailable"},{status:409});
-  if(row.passwordJson){const current=typeof body.currentPassword==="string"?body.currentPassword:"";const temporaryMatch=Boolean(row.passwordResetToken)&&current==="123456";if(!/^\d{6}$/.test(current)||(!temporaryMatch&&!(await verify(current,JSON.parse(row.passwordJson) as PasswordRecord))))return Response.json({error:"目前密碼不正確。"},{status:403})}
+  if(row.passwordJson){const current=typeof body.currentPassword==="string"?body.currentPassword:"";const temporaryMatch=Boolean(row.passwordResetToken)&&!row.passwordResetToken?.startsWith("consumed:")&&current==="123456";if(!/^\d{6}$/.test(current)||(!temporaryMatch&&!(await verify(current,JSON.parse(row.passwordJson) as PasswordRecord))))return Response.json({error:"目前密碼不正確。"},{status:403})}
   if(body.newRecord!==null&&!validRecord(body.newRecord))return Response.json({error:"新密碼格式不正確。"},{status:400});
-  const next=body.newRecord===null?null:JSON.stringify(body.newRecord);await db.update(boards).set({passwordJson:next,passwordResetToken:null,revision:row.revision+1,updatedAt:Date.now()}).where(eq(boards.ownerEmail,email));
+  const next=body.newRecord===null?null:JSON.stringify(body.newRecord);const resetToken=row.passwordResetToken&&!row.passwordResetToken.startsWith("consumed:")?`consumed:${row.passwordResetToken}`:row.passwordResetToken;await db.update(boards).set({passwordJson:next,passwordResetToken:resetToken,revision:row.revision+1,updatedAt:Date.now()}).where(eq(boards.ownerEmail,email));
   return Response.json({ok:true,hasPassword:Boolean(next)});
 }
