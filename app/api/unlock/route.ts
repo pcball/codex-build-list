@@ -13,6 +13,6 @@ export async function POST(request:Request){
   const body=await request.json().catch(()=>null) as {pin?:unknown}|null;if(!body||typeof body.pin!=="string"||!/^\d{6}$/.test(body.pin))return Response.json({ok:false},{status:400});
   const [row]=await getDb().select({passwordJson:boards.passwordJson,passwordResetToken:boards.passwordResetToken}).from(boards).where(eq(boards.ownerEmail,email)).limit(1);
   if(!row?.passwordJson)return Response.json({ok:true});
-  if(row.passwordResetToken&&body.pin==="123456")return Response.json({ok:true,temporary:true});
+  if(row.passwordResetToken&&!row.passwordResetToken.startsWith("consumed:")&&body.pin==="123456")return Response.json({ok:true,temporary:true});
   try{return Response.json({ok:await verify(body.pin,JSON.parse(row.passwordJson) as PasswordRecord)})}catch{return Response.json({ok:false})}
 }
