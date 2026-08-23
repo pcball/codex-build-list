@@ -27,12 +27,12 @@ type PasswordRecord = { salt:string; hash:string; iterations:number };
 
 function bytesToBase64(bytes:Uint8Array){let binary="";bytes.forEach(byte=>binary+=String.fromCharCode(byte));return window.btoa(binary)}
 function base64ToBytes(value:string){const binary=window.atob(value);return Uint8Array.from(binary,char=>char.charCodeAt(0))}
-async function passwordHash(password:string,salt:Uint8Array,iterations=180000){
+async function passwordHash(password:string,salt:Uint8Array,iterations=100000){
   const material=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);
   const bits=await crypto.subtle.deriveBits({name:"PBKDF2",hash:"SHA-256",salt,iterations},material,256);
   return bytesToBase64(new Uint8Array(bits));
 }
-async function createPasswordRecord(password:string):Promise<PasswordRecord>{const salt=crypto.getRandomValues(new Uint8Array(16));return {salt:bytesToBase64(salt),hash:await passwordHash(password,salt),iterations:180000}}
+async function createPasswordRecord(password:string):Promise<PasswordRecord>{const salt=crypto.getRandomValues(new Uint8Array(16));return {salt:bytesToBase64(salt),hash:await passwordHash(password,salt),iterations:100000}}
 async function verifyPassword(password:string,record:PasswordRecord){return (await passwordHash(password,base64ToBytes(record.salt),record.iterations))===record.hash}
 function pinOnly(value:string){return value.replace(/\D/g,"").slice(0,6)}
 function readLocalTasks(){const raw=window.localStorage.getItem(TASKS_KEY);if(!raw)return null;try{const parsed=JSON.parse(raw);return Array.isArray(parsed)?parsed as Task[]:null}catch{return null}}
