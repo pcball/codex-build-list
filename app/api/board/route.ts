@@ -5,13 +5,13 @@ import { boards } from "../../../db/schema";
 
 type Status = "idea" | "planning" | "building" | "done";
 type Priority = "高" | "中" | "低";
-type Task = { id:string; title:string; description:string; category:string; priority:Priority; effort:string; status:Status; createdAt:number };
+type Task = { id:string; title:string; description:string; category:string; priority:Priority; effort:string; status:Status; createdAt:number; archivedAt?:number };
 type PasswordRecord = { salt:string; hash:string; iterations:number };
 
 function owner(request:Request){return request.headers.get("oai-authenticated-user-email")?.trim().toLowerCase()||null}
 function validTask(value:unknown):value is Task{
   if(!value||typeof value!=="object")return false;const task=value as Record<string,unknown>;
-  return typeof task.id==="string"&&typeof task.title==="string"&&typeof task.description==="string"&&typeof task.category==="string"&&["高","中","低"].includes(String(task.priority))&&typeof task.effort==="string"&&["idea","planning","building","done"].includes(String(task.status))&&typeof task.createdAt==="number";
+  return typeof task.id==="string"&&typeof task.title==="string"&&typeof task.description==="string"&&typeof task.category==="string"&&["高","中","低"].includes(String(task.priority))&&typeof task.effort==="string"&&["idea","planning","building","done"].includes(String(task.status))&&typeof task.createdAt==="number"&&(task.archivedAt===undefined||typeof task.archivedAt==="number");
 }
 function validPasswordRecord(value:unknown):value is PasswordRecord{
   if(!value||typeof value!=="object")return false;const record=value as Record<string,unknown>;
