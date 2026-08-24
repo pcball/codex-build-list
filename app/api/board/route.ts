@@ -17,6 +17,10 @@ function validPasswordRecord(value:unknown):value is PasswordRecord{
   if(!value||typeof value!=="object")return false;const record=value as Record<string,unknown>;
   return typeof record.salt==="string"&&record.salt.length<100&&typeof record.hash==="string"&&record.hash.length<200&&typeof record.iterations==="number"&&record.iterations>=100000&&record.iterations<=500000;
 }
+function normalizeProjects(value:unknown,tasks:Task[]){
+  const saved=Array.isArray(value)?value.filter((item):item is string=>typeof item==="string"&&item.trim().length>0&&item.trim().length<=80).map(item=>item.trim()):[];
+  return [...new Set([...saved,...tasks.map(task=>task.category.trim()).filter(Boolean)])];
+}
 
 export async function GET(request:Request){
   const email=owner(request);if(!email)return Response.json({error:"Unauthorized"},{status:401});
@@ -27,17 +31,19 @@ export async function GET(request:Request){
   if(resetEnv.PASSWORD_RESET_TOKEN&&resetEnv.PASSWORD_RESET_RECORD&&row.passwordResetToken!==resetEnv.PASSWORD_RESET_TOKEN&&row.passwordResetToken!==consumedToken){
     try{const record=JSON.parse(resetEnv.PASSWORD_RESET_RECORD);if(validPasswordRecord(record)){passwordJson=JSON.stringify(record);await db.update(boards).set({passwordJson,passwordResetToken:resetEnv.PASSWORD_RESET_TOKEN,revision:row.revision+1,updatedAt:Date.now()}).where(eq(boards.ownerEmail,email))}}catch{}
   }
-  let tasks:Task[]=[];try{const parsed=JSON.parse(row.tasksJson);if(Array.isArray(parsed))tasks=parsed.filter(validTask)}catch{}
-  return Response.json({tasks,revision:row.revision,hasPassword:Boolean(passwordJson),updatedAt:row.updatedAt});
+  let tasks:Task[]=[];let projects:string[]=[];try{const parsed=JSON.parse(row.tasksJson);if(Array.isArray(parsed))tasks=parsed.filter(validTask);else if(parsed&&typeof parsed==="object"){const board=parsed as {tasks?:unknown;projects?:unknown};if(Array.isArray(board.tasks))tasks=board.tasks.filter(validTask);projects=normalizeProjects(board.projects,tasks)}}catch{}
+  projects=normalizeProjects(projects,tasks);
+  return Response.json({tasks,projects,revision:row.revision,hasPassword:Boolean(passwordJson),updatedAt:row.updatedAt});
 }
 
 export async function PUT(request:Request){
   const email=owner(request);if(!email)return Response.json({error:"Unauthorized"},{status:401});
-  const body=await request.json().catch(()=>null) as {tasks?:unknown;migrationPassword?:unknown}|null;
+  const body=await request.json().catch(()=>null) as {tasks?:unknown;projects?:unknown;migrationPassword?:unknown}|null;
   if(!body||!Array.isArray(body.tasks)||body.tasks.length>1000||!body.tasks.every(validTask))return Response.json({error:"Invalid tasks"},{status:400});
+  if(body.projects!==undefined&&(!Array.isArray(body.projects)||body.projects.length>100||!body.projects.every(item=>typeof item==="string"&&item.trim().length>0&&item.trim().length<=80)))return Response.json({error:"Invalid projects"},{status:400});
   const db=getDb();const [existing]=await db.select().from(boards).where(eq(boards.ownerEmail,email)).limit(1);
   const migrationPassword=validPasswordRecord(body.migrationPassword)?JSON.stringify(body.migrationPassword):null;
-  const now=Date.now();const tasksJson=JSON.stringify(body.tasks);
+  const now=Date.now();const projects=normalizeProjects(body.projects,body.tasks as Task[]);const tasksJson=JSON.stringify({tasks:body.tasks,projects});
   if(existing){
     const passwordJson=existing.passwordJson??migrationPassword;
     await db.update(boards).set({tasksJson,passwordJson,revision:existing.revision+1,updatedAt:now}).where(eq(boards.ownerEmail,email));
