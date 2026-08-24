@@ -23,6 +23,7 @@ const UNLOCKED_KEY = "codex-build-list-unlocked-v1";
 const MIGRATION_KEY = "codex-build-list-cloud-migrated-v1";
 const DIRTY_KEY = "codex-build-list-cloud-pending-v1";
 const TASKS_KEY = "codex-build-list-v1";
+const PROJECTS_KEY = "codex-build-list-projects-v1";
 type PasswordRecord = { salt:string; hash:string; iterations:number };
 
 function bytesToBase64(bytes:Uint8Array){let binary="";bytes.forEach(byte=>binary+=String.fromCharCode(byte));return window.btoa(binary)}
@@ -36,8 +37,10 @@ async function createPasswordRecord(password:string):Promise<PasswordRecord>{con
 async function verifyPassword(password:string,record:PasswordRecord){return (await passwordHash(password,base64ToBytes(record.salt),record.iterations))===record.hash}
 function pinOnly(value:string){return value.replace(/\D/g,"").slice(0,6)}
 function readLocalTasks(){const raw=window.localStorage.getItem(TASKS_KEY);if(!raw)return null;try{const parsed=JSON.parse(raw);return Array.isArray(parsed)?parsed as Task[]:null}catch{return null}}
+function readLocalProjects(){const raw=window.localStorage.getItem(PROJECTS_KEY);if(!raw)return null;try{const parsed=JSON.parse(raw);return Array.isArray(parsed)?parsed.filter(item=>typeof item==="string") as string[]:null}catch{return null}}
 function readLocalPassword(){const raw=window.localStorage.getItem(PASSWORD_KEY);if(!raw)return null;try{return JSON.parse(raw) as PasswordRecord}catch{return null}}
 function mergeForMigration(remote:Task[],local:Task[]){const defaults=new Map(seed.map(task=>[task.id,JSON.stringify(task)]));const merged=new Map(remote.map(task=>[task.id,task]));for(const task of local){const unchangedDefault=defaults.get(task.id)===JSON.stringify(task);if(!unchangedDefault||!merged.has(task.id))merged.set(task.id,task)}return [...merged.values()]}
+function projectNames(tasks:Task[],saved:string[]=[]){return [...new Set([...saved,...tasks.map(task=>task.category)].map(name=>name.trim()).filter(Boolean))]}
 
 function Icon({ name, size=18 }:{ name:"plus"|"search"|"grid"|"box"|"spark"|"trash"|"edit"|"arrow"|"arrowBack"|"close"|"settings"|"lock"|"unlock"; size?:number }) {
   const paths = {
@@ -55,7 +58,8 @@ function Icon({ name, size=18 }:{ name:"plus"|"search"|"grid"|"box"|"spark"|"tra
 
 export default function Home() {
   const [tasks,setTasks] = useState<Task[]>(seed); const [loaded,setLoaded] = useState(false);
-  const [query,setQuery] = useState(""); const [priority,setPriority] = useState("全部");
+  const [projects,setProjects] = useState<string[]>(projectNames(seed)); const [newProject,setNewProject] = useState(""); const [addingProject,setAddingProject] = useState(false); const [projectError,setProjectError] = useState("");
+  const [query,setQuery] = useState(""); const [priority,setPriority] = useState("全部"); const [projectFilter,setProjectFilter] = useState("全部");
   const [modalOpen,setModalOpen] = useState(false); const [editingId,setEditingId] = useState<string|null>(null); const [form,setForm] = useState(blankTask);
   const [settingsOpen,setSettingsOpen] = useState(false); const [hasPassword,setHasPassword] = useState(false);
   const [locked,setLocked] = useState(false); const [passwordReady,setPasswordReady] = useState(false);
@@ -66,38 +70,39 @@ export default function Home() {
   useEffect(()=>{
     let cancelled=false;
     async function start(){
-      const local=readLocalTasks();const localPassword=readLocalPassword();
+      const local=readLocalTasks();const localProjects=readLocalProjects();const localPassword=readLocalPassword();
       try{
         const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)throw new Error("sync unavailable");
-        const cloud=await response.json() as {tasks:Task[]|null;hasPassword:boolean};let next:Task[];
+        const cloud=await response.json() as {tasks:Task[]|null;projects?:string[];hasPassword:boolean};let next:Task[];
         const needsMigration=!window.localStorage.getItem(MIGRATION_KEY);
         const hasPendingChanges=Boolean(window.localStorage.getItem(DIRTY_KEY));
         if(cloud.tasks===null)next=local??seed;else if(local&&hasPendingChanges)next=local;else next=local&&needsMigration?mergeForMigration(cloud.tasks,local):cloud.tasks;
-        let hasPassword=cloud.hasPassword;
+        const nextProjects=projectNames(next,[...(cloud.projects??[]),...(localProjects??[])]);let hasPassword=cloud.hasPassword;
         if(cloud.tasks===null||(local&&hasPendingChanges)||(local&&needsMigration)||(!cloud.hasPassword&&localPassword&&needsMigration)){
-          const saved=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks:next,migrationPassword:localPassword})});if(!saved.ok)throw new Error("migration failed");const result=await saved.json() as {hasPassword:boolean};hasPassword=result.hasPassword;
+          const saved=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks:next,projects:nextProjects,migrationPassword:localPassword})});if(!saved.ok)throw new Error("migration failed");const result=await saved.json() as {hasPassword:boolean};hasPassword=result.hasPassword;
         }
-        if(cancelled)return;const serialized=JSON.stringify(next);lastServerJson.current=serialized;setTasks(next);window.localStorage.setItem(TASKS_KEY,serialized);window.localStorage.setItem(MIGRATION_KEY,"yes");window.localStorage.removeItem(DIRTY_KEY);setHasPassword(hasPassword);setLocked(hasPassword&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setCloudReady(true);setSyncState("saved");
+        if(cancelled)return;const serialized=JSON.stringify({tasks:next,projects:nextProjects});lastServerJson.current=serialized;setTasks(next);setProjects(nextProjects);window.localStorage.setItem(TASKS_KEY,JSON.stringify(next));window.localStorage.setItem(PROJECTS_KEY,JSON.stringify(nextProjects));window.localStorage.setItem(MIGRATION_KEY,"yes");window.localStorage.removeItem(DIRTY_KEY);setHasPassword(hasPassword);setLocked(hasPassword&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setCloudReady(true);setSyncState("saved");
       }catch{
-        if(cancelled)return;const fallback=local??seed;lastServerJson.current=JSON.stringify(fallback);setTasks(fallback);setHasPassword(Boolean(localPassword));setLocked(Boolean(localPassword)&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setSyncState("offline");
+        if(cancelled)return;const fallback=local??seed;const fallbackProjects=projectNames(fallback,localProjects??[]);lastServerJson.current=JSON.stringify({tasks:fallback,projects:fallbackProjects});setTasks(fallback);setProjects(fallbackProjects);setHasPassword(Boolean(localPassword));setLocked(Boolean(localPassword)&&window.sessionStorage.getItem(UNLOCKED_KEY)!=="yes");setSyncState("offline");
       }finally{if(!cancelled){setPasswordReady(true);setLoaded(true)}}
     }
     start();return()=>{cancelled=true};
   },[]);
   useEffect(()=>{
-    if(!loaded)return;const serialized=JSON.stringify(tasks);window.localStorage.setItem(TASKS_KEY,serialized);if(!cloudReady){if(serialized!==lastServerJson.current)window.localStorage.setItem(DIRTY_KEY,"yes");return}if(serialized===lastServerJson.current)return;
-    const timer=window.setTimeout(()=>{setSyncState("saving");syncQueue.current=syncQueue.current.then(async()=>{const response=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks})});if(!response.ok)throw new Error("save failed");lastServerJson.current=JSON.stringify(tasks);window.localStorage.removeItem(DIRTY_KEY);setSyncState("saved")}).catch(()=>{window.localStorage.setItem(DIRTY_KEY,"yes");setSyncState("offline")})},450);return()=>window.clearTimeout(timer);
-  },[tasks,loaded,cloudReady]);
+    if(!loaded)return;const serialized=JSON.stringify({tasks,projects});window.localStorage.setItem(TASKS_KEY,JSON.stringify(tasks));window.localStorage.setItem(PROJECTS_KEY,JSON.stringify(projects));if(!cloudReady){if(serialized!==lastServerJson.current)window.localStorage.setItem(DIRTY_KEY,"yes");return}if(serialized===lastServerJson.current)return;
+    const timer=window.setTimeout(()=>{setSyncState("saving");syncQueue.current=syncQueue.current.then(async()=>{const response=await fetch("/api/board",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({tasks,projects})});if(!response.ok)throw new Error("save failed");lastServerJson.current=serialized;window.localStorage.removeItem(DIRTY_KEY);setSyncState("saved")}).catch(()=>{window.localStorage.setItem(DIRTY_KEY,"yes");setSyncState("offline")})},450);return()=>window.clearTimeout(timer);
+  },[tasks,projects,loaded,cloudReady]);
   useEffect(()=>{
-    if(!cloudReady)return;async function refresh(){if(JSON.stringify(tasks)!==lastServerJson.current)return;try{const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)return;const cloud=await response.json() as {tasks:Task[]|null;hasPassword:boolean};if(!cloud.tasks)return;const serialized=JSON.stringify(cloud.tasks);setHasPassword(cloud.hasPassword);if(serialized!==lastServerJson.current){lastServerJson.current=serialized;setTasks(cloud.tasks);window.localStorage.setItem(TASKS_KEY,serialized)}}catch{}}
+    if(!cloudReady)return;async function refresh(){if(JSON.stringify({tasks,projects})!==lastServerJson.current)return;try{const response=await fetch("/api/board",{cache:"no-store"});if(!response.ok)return;const cloud=await response.json() as {tasks:Task[]|null;projects?:string[];hasPassword:boolean};if(!cloud.tasks)return;const nextProjects=projectNames(cloud.tasks,cloud.projects??[]);const serialized=JSON.stringify({tasks:cloud.tasks,projects:nextProjects});setHasPassword(cloud.hasPassword);if(serialized!==lastServerJson.current){lastServerJson.current=serialized;setTasks(cloud.tasks);setProjects(nextProjects);window.localStorage.setItem(TASKS_KEY,JSON.stringify(cloud.tasks));window.localStorage.setItem(PROJECTS_KEY,JSON.stringify(nextProjects))}}catch{}}
     const timer=window.setInterval(refresh,15000);window.addEventListener("focus",refresh);return()=>{window.clearInterval(timer);window.removeEventListener("focus",refresh)};
-  },[cloudReady,tasks]);
-  const visibleTasks=useMemo(()=>tasks.filter(task=>`${task.title} ${task.description} ${task.category}`.toLowerCase().includes(query.toLowerCase())&&(priority==="全部"||task.priority===priority)),[tasks,query,priority]);
-  function openNew(status:Status="idea"){setEditingId(null);setForm({...blankTask,status});setModalOpen(true)}
+  },[cloudReady,tasks,projects]);
+  const visibleTasks=useMemo(()=>tasks.filter(task=>`${task.title} ${task.description} ${task.category}`.toLowerCase().includes(query.toLowerCase())&&(priority==="全部"||task.priority===priority)&&(projectFilter==="全部"||task.category===projectFilter)),[tasks,query,priority,projectFilter]);
+  function openNew(status:Status="idea"){setEditingId(null);setForm({...blankTask,category:projectFilter!=="全部"?projectFilter:projects.includes(blankTask.category)?blankTask.category:projects[0]??"新產品",status});setModalOpen(true)}
   function openEdit(task:Task){setEditingId(task.id);setForm({title:task.title,description:task.description,category:task.category,priority:task.priority,effort:task.effort,status:task.status});setModalOpen(true)}
   function saveTask(e:FormEvent){e.preventDefault();if(!form.title.trim())return;if(editingId)setTasks(c=>c.map(t=>t.id===editingId?{...t,...form,title:form.title.trim()}:t));else setTasks(c=>[...c,{...form,title:form.title.trim(),id:crypto.randomUUID(),createdAt:Date.now()}]);setModalOpen(false)}
   function moveTask(task:Task){const i=columns.findIndex(c=>c.id===task.status);if(i<columns.length-1)setTasks(c=>c.map(t=>t.id===task.id?{...t,status:columns[i+1].id}:t))}
   function moveTaskBack(task:Task){const i=columns.findIndex(c=>c.id===task.status);if(i>0)setTasks(c=>c.map(t=>t.id===task.id?{...t,status:columns[i-1].id}:t))}
+  function addProject(e:FormEvent){e.preventDefault();const name=newProject.trim();if(!name){setProjectError("請輸入項目名稱。");return}if(name.length>40){setProjectError("項目名稱最多 40 個字。");return}if(projects.includes(name)){setProjectError("這個項目已經存在。");return}setProjects(current=>[...current,name]);setNewProject("");setProjectError("");setAddingProject(false)}
   async function unlock(e:FormEvent){e.preventDefault();setUnlockError("");setUnlockBusy(true);let ok=false;try{const response=await fetch("/api/unlock",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin:unlockInput})});ok=response.ok&&Boolean((await response.json()).ok)}catch{const record=readLocalPassword();ok=Boolean(record&&await verifyPassword(unlockInput,record))}if(ok){window.sessionStorage.setItem(UNLOCKED_KEY,"yes");setLocked(false);setUnlockInput("")}else setUnlockError("密碼不正確，請再試一次。");setUnlockBusy(false)}
   function openSettings(){setCurrentPassword("");setNewPassword("");setConfirmPassword("");setSettingsMessage("");setSettingsError("");setSettingsOpen(true)}
   async function savePassword(e:FormEvent){
@@ -115,7 +120,8 @@ export default function Home() {
   return <main className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark"><Icon name="spark" size={21}/></span><span>BUILD<span>LIST</span></span></div>
-      <nav aria-label="主要選單"><button className="nav-item active"><Icon name="grid"/>功能待辦板</button><button className="nav-item" onClick={()=>setPriority("高")}><Icon name="spark"/>優先項目</button><button className="nav-item" onClick={()=>setQuery("產品")}><Icon name="box"/>產品構想</button><button className="nav-item" onClick={openSettings}><Icon name="settings"/>設定</button></nav>
+      <nav aria-label="主要選單"><button className="nav-item active" onClick={()=>{setProjectFilter("全部");setPriority("全部");setQuery("")}}><Icon name="grid"/>功能待辦板</button><button className="nav-item" onClick={()=>setPriority("高")}><Icon name="spark"/>優先項目</button><button className="nav-item" onClick={openSettings}><Icon name="settings"/>設定</button></nav>
+      <section className="project-manager" aria-label="項目管理"><div className="project-manager-title"><span>所屬項目</span><button aria-label="新增項目" onClick={()=>{setAddingProject(true);setProjectError("")}}><Icon name="plus" size={15}/></button></div><button className={`project-link ${projectFilter==="全部"?"selected":""}`} onClick={()=>setProjectFilter("全部")}><span>全部項目</span><b>{tasks.length}</b></button>{projects.map(project=><button className={`project-link ${projectFilter===project?"selected":""}`} key={project} onClick={()=>setProjectFilter(project)}><span>{project}</span><b>{tasks.filter(task=>task.category===project).length}</b></button>)}{addingProject&&<form className="project-form" onSubmit={addProject}><input autoFocus maxLength={40} value={newProject} onChange={e=>setNewProject(e.target.value)} placeholder="輸入項目名稱"/><div><button type="button" onClick={()=>{setAddingProject(false);setNewProject("");setProjectError("")}}>取消</button><button type="submit">加入</button></div>{projectError&&<small>{projectError}</small>}</form>}<button className="add-project-button" onClick={()=>{setAddingProject(true);setProjectError("")}}><Icon name="plus" size={14}/>新增項目</button></section>
       <div className="sidebar-note"><Icon name="spark" size={22}/><strong>先記下，再完善</strong><p>不用一開始就把需求想完整。記下核心問題，之後再和 Codex 一起拆解。</p></div>
       <div className="profile"><span>LW</span><div><strong>李偉康</strong><small>個人工作空間</small></div><button className="mobile-settings" aria-label="開啟設定" onClick={openSettings}><Icon name="settings"/></button></div>
     </aside>
@@ -133,7 +139,7 @@ export default function Home() {
     </section>
     {modalOpen&&<div className="modal-backdrop" onMouseDown={()=>setModalOpen(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" aria-label="關閉" onClick={()=>setModalOpen(false)}><Icon name="close"/></button><p className="eyebrow">{editingId?"EDIT ITEM":"NEW IDEA"}</p><h2 id="modal-title">{editingId?"編輯構想":"記下一個新構想"}</h2><p className="modal-lead">只要先寫下核心想法，其他細節可以稍後補上。</p>
       <form onSubmit={saveTask}><label>功能或產品名稱<input autoFocus required value={form.title} onChange={e=>setForm({...form,title:e.target.value})} placeholder="例如：Podcast 後台管理"/></label><label>想解決什麼問題？<textarea rows={3} value={form.description} onChange={e=>setForm({...form,description:e.target.value})} placeholder="簡單說明使用情境和預期成果…"/></label>
-      <div className="form-grid"><label>所屬項目<input value={form.category} onChange={e=>setForm({...form,category:e.target.value})}/></label><label>目前階段<select value={form.status} onChange={e=>setForm({...form,status:e.target.value as Status})}>{columns.map(c=><option value={c.id} key={c.id}>{c.name}</option>)}</select></label><label>優先級<select value={form.priority} onChange={e=>setForm({...form,priority:e.target.value as Priority})}><option>高</option><option>中</option><option>低</option></select></label><label>預計投入<select value={form.effort} onChange={e=>setForm({...form,effort:e.target.value})}><option>快速修改</option><option>中型功能</option><option>大型功能</option><option>需要研究</option></select></label></div>
+      <div className="form-grid"><label>所屬項目<select required value={form.category} onChange={e=>setForm({...form,category:e.target.value})}>{projects.map(project=><option value={project} key={project}>{project}</option>)}</select></label><label>目前階段<select value={form.status} onChange={e=>setForm({...form,status:e.target.value as Status})}>{columns.map(c=><option value={c.id} key={c.id}>{c.name}</option>)}</select></label><label>優先級<select value={form.priority} onChange={e=>setForm({...form,priority:e.target.value as Priority})}><option>高</option><option>中</option><option>低</option></select></label><label>預計投入<select value={form.effort} onChange={e=>setForm({...form,effort:e.target.value})}><option>快速修改</option><option>中型功能</option><option>大型功能</option><option>需要研究</option></select></label></div>
       <div className="form-actions">{editingId&&<button type="button" className="delete-button" onClick={()=>{setTasks(c=>c.filter(t=>t.id!==editingId));setModalOpen(false)}}><Icon name="trash" size={16}/>刪除</button>}<button type="button" className="cancel-button" onClick={()=>setModalOpen(false)}>取消</button><button type="submit" className="primary-button">{editingId?"儲存修改":"加入待辦板"}</button></div></form></section></div>}
     {settingsOpen&&<div className="modal-backdrop" onMouseDown={()=>setSettingsOpen(false)}><section className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" aria-label="關閉" onClick={()=>setSettingsOpen(false)}><Icon name="close"/></button><p className="eyebrow">SETTINGS</p><h2 id="settings-title">安全設定</h2><p className="modal-lead">設定固定 6 位數字的進入密碼。關閉瀏覽器工作階段後，系統會再次要求密碼。</p>
       <div className={`security-status ${hasPassword?"enabled":""}`}><span><Icon name={hasPassword?"lock":"unlock"}/></span><div><strong>{hasPassword?"密碼保護已啟用":"尚未設定進入密碼"}</strong><p>{hasPassword?"同一組密碼適用於你的所有裝置。":"設定後，密碼會同步到手機和電腦。"}</p></div></div>
